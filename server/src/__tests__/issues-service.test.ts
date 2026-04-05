@@ -7,6 +7,7 @@ import {
   companies,
   createDb,
   executionWorkspaces,
+  heartbeatRuns,
   instanceSettings,
   issueComments,
   issueInboxArchives,
@@ -856,6 +857,326 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(followUp.executionWorkspacePreference).toBe("reuse_existing");
     expect(followUp.executionWorkspaceSettings).toEqual({
       mode: "operator_branch",
+    });
+  });
+});
+
+describeEmbeddedPostgres("issueService.checkout stale execution recovery", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-checkout-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(heartbeatRuns);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("reclaims a blocked issue when its execution lock points at a terminal run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const staleRunId = randomUUID();
+    const retryRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: staleRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-04-05T15:13:41.113Z"),
+        finishedAt: new Date("2026-04-05T15:17:07.330Z"),
+      },
+      {
+        id: retryRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId },
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked issue with stale execution lock",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionRunId: staleRunId,
+      executionAgentNameKey: "codexcoder",
+      executionLockedAt: new Date("2026-04-05T15:15:55.614Z"),
+    });
+
+    const updated = await svc.checkout(issueId, agentId, ["todo", "backlog", "blocked"], retryRunId);
+
+    expect(updated.status).toBe("in_progress");
+    expect(updated.assigneeAgentId).toBe(agentId);
+    expect(updated.checkoutRunId).toBe(retryRunId);
+    expect(updated.executionRunId).toBe(retryRunId);
+
+    const persisted = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(persisted).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      checkoutRunId: retryRunId,
+      executionRunId: retryRunId,
+    });
+  });
+
+  it("does not clear another agent's stale execution lock when checkout conflicts", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const issueId = randomUUID();
+    const staleRunId = randomUUID();
+    const retryRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "Atlas",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "OtherAgent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: staleRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "succeeded",
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-04-05T15:13:41.113Z"),
+        finishedAt: new Date("2026-04-05T15:17:07.330Z"),
+      },
+      {
+        id: retryRunId,
+        companyId,
+        agentId: otherAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId },
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked issue with stale execution lock",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId: assigneeAgentId,
+      executionRunId: staleRunId,
+      executionAgentNameKey: "atlas",
+      executionLockedAt: new Date("2026-04-05T15:15:55.614Z"),
+    });
+
+    await expect(
+      svc.checkout(issueId, otherAgentId, ["todo", "backlog", "blocked"], retryRunId),
+    ).rejects.toThrow("Issue checkout conflict");
+
+    const persisted = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(persisted).toMatchObject({
+      status: "blocked",
+      assigneeAgentId,
+      checkoutRunId: null,
+      executionRunId: staleRunId,
+      executionAgentNameKey: "atlas",
+      executionLockedAt: new Date("2026-04-05T15:15:55.614Z"),
+    });
+  });
+
+  it("reclaims an assigned issue when execution truth is occupied by a live non-assignee run", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const managerAgentId = randomUUID();
+    const issueId = randomUUID();
+    const managerRunId = randomUUID();
+    const retryRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values([
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "Atlas",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: managerAgentId,
+        companyId,
+        name: "Hephaestus",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: managerRunId,
+        companyId,
+        agentId: managerAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "issue_comment_mentioned",
+        status: "running",
+        contextSnapshot: { issueId },
+        startedAt: new Date("2026-04-05T16:55:00.000Z"),
+      },
+      {
+        id: retryRunId,
+        companyId,
+        agentId: assigneeAgentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId },
+      },
+    ]);
+
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Blocked issue with manager execution occupancy",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId,
+      executionRunId: managerRunId,
+      executionAgentNameKey: "hephaestus",
+      executionLockedAt: new Date("2026-04-05T16:55:00.000Z"),
+    });
+
+    const updated = await svc.checkout(issueId, assigneeAgentId, ["todo", "backlog", "blocked"], retryRunId);
+
+    expect(updated.status).toBe("in_progress");
+    expect(updated.assigneeAgentId).toBe(assigneeAgentId);
+    expect(updated.checkoutRunId).toBe(retryRunId);
+    expect(updated.executionRunId).toBe(retryRunId);
+
+    const persisted = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionAgentNameKey: issues.executionAgentNameKey,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(persisted).toMatchObject({
+      status: "in_progress",
+      assigneeAgentId,
+      checkoutRunId: retryRunId,
+      executionRunId: retryRunId,
     });
   });
 });
