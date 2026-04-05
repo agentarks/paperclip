@@ -675,12 +675,20 @@ export function issueService(db: Db) {
     );
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+  async function getHeartbeatRunLock(runId: string) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({
+        status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
+    return run;
+  }
+
+  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+    const run = await getHeartbeatRunLock(runId);
     if (!run) return true;
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
@@ -723,9 +731,17 @@ export function issueService(db: Db) {
     return adopted;
   }
 
-  async function clearStaleExecutionRun(issueId: string, expectedExecutionRunId: string) {
-    const stale = await isTerminalOrMissingHeartbeatRun(expectedExecutionRunId);
-    if (!stale) return false;
+  async function clearRecoverableExecutionRun(
+    issueId: string,
+    expectedExecutionRunId: string,
+    actorAgentId: string,
+  ) {
+    const run = await getHeartbeatRunLock(expectedExecutionRunId);
+    const recoverable =
+      !run ||
+      TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) ||
+      run.agentId !== actorAgentId;
+    if (!recoverable) return false;
 
     const cleared = await db
       .update(issues)
@@ -1502,9 +1518,10 @@ export function issueService(db: Db) {
           !repairedExecutionConflict &&
           current.executionRunId &&
           current.executionRunId !== checkoutRunId &&
-          current.checkoutRunId == null
+          current.checkoutRunId == null &&
+          (current.assigneeAgentId == null || current.assigneeAgentId === agentId)
         ) {
-          const cleared = await clearStaleExecutionRun(id, current.executionRunId);
+          const cleared = await clearRecoverableExecutionRun(id, current.executionRunId, agentId);
           if (cleared) {
             repairedExecutionConflict = true;
             continue;
